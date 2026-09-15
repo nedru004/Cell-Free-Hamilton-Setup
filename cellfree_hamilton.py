@@ -28,13 +28,16 @@ LogFn = Callable[[str], None]
 # Settings
 # ---------------------------------------------------------------------------
 
+TIP_MAX_UL = {10: 10.0, 50: 50.0, 300: 300.0}
+
+
 @dataclass
 class Settings:
     dna_vol_ul: float = 4.0
     mastermix_vol_ul: float = 16.0
-    target_concentration: float = 10.0
+    target_concentration: float = 40.0
     concentration_unit: str = "ng/uL"  # "ng/uL" or "nM"
-    min_resuspend_ul: float = 10.0
+    min_resuspend_ul: float = 5.0
     max_resuspend_ul: float = 120.0
     resuspend_mix_cycles: int = 5
     dest_mix_cycles: int = 3
@@ -48,14 +51,24 @@ class Settings:
     tip_carrier_rail: int = 7
     plate_carrier_rail: int = 1
     trough_carrier_rail: int = 43
+    tube_carrier_rail: int = 35
     dna_plate_site: int = 0
     gator_plate_1_site: int = 1
     gator_plate_2_site: int = 2
-    resuspend_tips_site: int = 0
-    transfer_tips_site: int = 1
-    extra_tips_site: int = 2
     water_trough_site: int = 0
-    mastermix_trough_site: int = 1
+    mastermix_tube_site: int = 0
+    load_10ul_tips: bool = True
+    load_50ul_tips: bool = False
+    load_300ul_tips: bool = True
+    tips_10ul_site: int = 0
+    tips_10ul_extra_site: int = 1
+    tips_50ul_site: int = 2
+    tips_50ul_extra_site: int = -1
+    tips_300ul_site: int = 3
+    tips_300ul_extra_site: int = 4
+    resuspend_tip_ul: int = 300
+    mastermix_tip_ul: int = 300
+    dna_tip_ul: int = 10
 
 
 # ---------------------------------------------------------------------------
@@ -155,19 +168,56 @@ def resolve_file(upload_value, fallback_path: str = "") -> tuple[bytes, str]:
     raise ValueError("Select a file or enter a path.")
 
 
+def loaded_tip_racks(settings: Settings) -> list[tuple[str, int, int]]:
+    """Return (resource_name, tip_size_ul, carrier_site) for racks on the deck."""
+    racks: list[tuple[str, int, int]] = []
+
+    def add(loaded: bool, size: int, primary: int, extra: int) -> None:
+        if not loaded:
+            return
+        racks.append((f"tips_{size}uL_0", size, primary))
+        if extra >= 0:
+            racks.append((f"tips_{size}uL_1", size, extra))
+
+    add(settings.load_10ul_tips, 10, settings.tips_10ul_site, settings.tips_10ul_extra_site)
+    add(settings.load_50ul_tips, 50, settings.tips_50ul_site, settings.tips_50ul_extra_site)
+    add(settings.load_300ul_tips, 300, settings.tips_300ul_site, settings.tips_300ul_extra_site)
+    return racks
+
+
+def racks_for_tip_size(settings: Settings, size: int) -> list[str]:
+    return [name for name, tip_size, _ in loaded_tip_racks(settings) if tip_size == size]
+
+
 def validate_settings(settings: Settings) -> None:
     plate_sites = [settings.dna_plate_site, settings.gator_plate_1_site, settings.gator_plate_2_site]
     if len(set(plate_sites)) != 3:
         raise ValueError("DNA plate and both Gator plates must occupy different carrier sites.")
-    tip_sites = [settings.resuspend_tips_site, settings.transfer_tips_site, settings.extra_tips_site]
-    if len(set(tip_sites)) != 3:
-        raise ValueError("Tip racks must occupy different carrier sites.")
-    if settings.water_trough_site == settings.mastermix_trough_site:
-        raise ValueError("Water and mastermix troughs must occupy different carrier sites.")
+    racks = loaded_tip_racks(settings)
+    if not racks:
+        raise ValueError("Load at least one tip rack.")
+    sites = [site for _, _, site in racks]
+    if len(set(sites)) != len(sites):
+        raise ValueError("Loaded tip racks must occupy different carrier sites.")
+    if not 0 <= settings.mastermix_tube_site <= 31:
+        raise ValueError("Mastermix 2 mL tube site must be between 0 and 31.")
     if settings.dna_vol_ul <= 0 or settings.mastermix_vol_ul <= 0:
         raise ValueError("DNA and mastermix volumes must be greater than 0.")
     if settings.concentration_unit not in ("ng/uL", "nM"):
         raise ValueError("Concentration unit must be ng/uL or nM.")
+    for step, size in (
+        ("resuspend", settings.resuspend_tip_ul),
+        ("mastermix", settings.mastermix_tip_ul),
+        ("DNA transfer", settings.dna_tip_ul),
+    ):
+        if size not in TIP_MAX_UL:
+            raise ValueError(f"{step} tip size must be 10, 50, or 300 µL.")
+        if not racks_for_tip_size(settings, size):
+            raise ValueError(f"{step} uses {size} µL tips, but that rack is not loaded.")
+    if settings.dna_vol_ul > TIP_MAX_UL[settings.dna_tip_ul]:
+        raise ValueError("DNA volume exceeds the selected DNA tip size.")
+    if settings.mastermix_vol_ul > TIP_MAX_UL[settings.mastermix_tip_ul]:
+        raise ValueError("Mastermix volume exceeds the selected mastermix tip size.")
 
 
 def _as_bytes(source: FileInput) -> bytes:
@@ -493,6 +543,10 @@ def build_plan(
     unique_sources = {t.source_well: t.resuspend_ul for t in transfers}
     water_ul = round(sum(unique_sources.values()) * 1.15, 1)
     mastermix_ul = round(len(transfers) * settings.mastermix_vol_ul * 1.15, 1)
+    if mastermix_ul > 1800 and transfers:
+        transfers[0].warnings.append(
+            "Total mastermix exceeds ~1.8 mL; use a second 2 mL tube or reduce reactions."
+        )
     return RunPlan(
         transfers=transfers,
         gator_titles=titles,
@@ -511,8 +565,11 @@ def format_plan(plan: RunPlan) -> str:
         f"DNA transfer: {plan.settings.dna_vol_ul} µL",
         f"Mastermix: {plan.settings.mastermix_vol_ul} µL",
         f"Target: {plan.settings.target_concentration} {plan.settings.concentration_unit}",
-        f"Water needed (with 15% extra): {plan.water_ul:.0f} µL",
-        f"Mastermix needed (with 15% extra): {plan.mastermix_ul:.0f} µL",
+        f"Water needed (with 15% extra): {plan.water_ul:.0f} µL in the water trough",
+        f"Mastermix needed (with 15% extra): {plan.mastermix_ul:.0f} µL in a 2 mL tube",
+        f"Tips: resuspend {plan.settings.resuspend_tip_ul} µL, "
+        f"mastermix {plan.settings.mastermix_tip_ul} µL, "
+        f"DNA {plan.settings.dna_tip_ul} µL",
     ]
     if plan.unmatched_dest_names:
         lines.append("Unmatched Gator names: " + ", ".join(plan.unmatched_dest_names))
@@ -627,11 +684,17 @@ def setup_deck(settings: Settings):
         PLT_CAR_L5AC_A00,
         TIP_CAR_480_A00,
         Cor_96_wellplate_360ul_Fb,
+        hamilton_96_tiprack_10uL_filter,
+        hamilton_96_tiprack_50uL_filter,
         hamilton_96_tiprack_300uL_filter,
         hamilton_1_trough_60ml_Vb,
     )
+    from pylabrobot.resources.eppendorf.tubes import Eppendorf_DNA_LoBind_2ml_Ub
     from pylabrobot.resources.hamilton import STARDeck
     from pylabrobot.resources.hamilton.trough_carriers import Trough_CAR_5R60_A00
+    from pylabrobot.resources.hamilton.tube_carriers import (
+        hamilton_tube_carrier_32_a00_insert_eppendorf_1_5mL,
+    )
 
     validate_settings(settings)
 
@@ -645,10 +708,14 @@ def setup_deck(settings: Settings):
         deck=STARDeck(core_grippers="1000uL-5mL-on-waste"),
     )
 
+    tip_builders = {
+        10: hamilton_96_tiprack_10uL_filter,
+        50: hamilton_96_tiprack_50uL_filter,
+        300: hamilton_96_tiprack_300uL_filter,
+    }
     tip_car = TIP_CAR_480_A00(name="tip_carrier")
-    tip_car[settings.resuspend_tips_site] = hamilton_96_tiprack_300uL_filter(name="resuspend_tips")
-    tip_car[settings.transfer_tips_site] = hamilton_96_tiprack_300uL_filter(name="transfer_tips")
-    tip_car[settings.extra_tips_site] = hamilton_96_tiprack_300uL_filter(name="extra_tips")
+    for name, size, site in loaded_tip_racks(settings):
+        tip_car[site] = tip_builders[size](name=name)
     lh.deck.assign_child_resource(tip_car, rails=settings.tip_carrier_rail)
 
     plt_car = PLT_CAR_L5AC_A00(name="plate_carrier")
@@ -659,8 +726,11 @@ def setup_deck(settings: Settings):
 
     trough_car = Trough_CAR_5R60_A00(name="trough_carrier")
     trough_car[settings.water_trough_site] = hamilton_1_trough_60ml_Vb(name="water_trough")
-    trough_car[settings.mastermix_trough_site] = hamilton_1_trough_60ml_Vb(name="mastermix_trough")
     lh.deck.assign_child_resource(trough_car, rails=settings.trough_carrier_rail)
+
+    tube_car = hamilton_tube_carrier_32_a00_insert_eppendorf_1_5mL(name="tube_carrier")
+    tube_car[settings.mastermix_tube_site] = Eppendorf_DNA_LoBind_2ml_Ub(name="mastermix_tube")
+    lh.deck.assign_child_resource(tube_car, rails=settings.tube_carrier_rail)
 
     return lh
 
@@ -686,14 +756,6 @@ def _spaced_channels(rows: list[str]) -> list[int]:
     return [idx - base for idx in indexes]
 
 
-def _has_resource(lh, name: str) -> bool:
-    try:
-        lh.deck.get_resource(name)
-        return True
-    except Exception:
-        return False
-
-
 async def _pick_column_tips(lh, cursor: TipCursor, rows: list[str], channels: list[int]):
     rack_name, col = cursor.consume_column()
     rack = lh.deck.get_resource(rack_name)
@@ -702,28 +764,59 @@ async def _pick_column_tips(lh, cursor: TipCursor, rows: list[str], channels: li
     return rack_name, col
 
 
-async def _mix(lh, wells, vols: list[float], channels: list[int], cycles: int, flow_rate: float):
+async def _mix(
+    lh,
+    wells,
+    vols: list[float],
+    channels: list[int],
+    cycles: int,
+    flow_rate: float,
+    tip_max_ul: float,
+):
     if cycles <= 0:
         return
-    mix_vols = [max(2.0, min(v * 0.6, 40.0, v - 1.0 if v > 3 else v)) for v in vols]
+    mix_vols = [
+        max(1.0, min(v * 0.6, tip_max_ul * 0.8, v - 1.0 if v > 3 else v))
+        for v in vols
+    ]
     rates = [flow_rate] * len(wells)
     for _ in range(cycles):
         await lh.aspirate(wells, vols=mix_vols, use_channels=channels, flow_rates=rates)
         await lh.dispense(wells, vols=mix_vols, use_channels=channels, flow_rates=rates)
 
 
+async def _aspirate_tube_sequential(lh, tube, vols: list[float], channels: list[int], flow_rate: float):
+    """Aspirate from one 2 mL tube one channel at a time."""
+    for vol, channel in zip(vols, channels):
+        await lh.aspirate(
+            [tube],
+            vols=[vol],
+            use_channels=[channel],
+            flow_rates=[flow_rate],
+        )
+
+
 async def run_protocol(lh, plan: RunPlan, log: LogFn = print) -> None:
     settings = plan.settings
     dna_plate = lh.deck.get_resource("dna_plate")
     water = lh.deck.get_resource("water_trough")
-    mastermix = lh.deck.get_resource("mastermix_trough")
-    resuspend_cursor = TipCursor(["resuspend_tips"])
-    transfer_racks = ["transfer_tips"]
-    if _has_resource(lh, "extra_tips"):
-        transfer_racks.append("extra_tips")
-    transfer_cursor = TipCursor(transfer_racks)
+    mastermix = lh.deck.get_resource("mastermix_tube")
+    cursors: dict[int, TipCursor] = {}
+    for size in (settings.resuspend_tip_ul, settings.mastermix_tip_ul, settings.dna_tip_ul):
+        if size not in cursors:
+            cursors[size] = TipCursor(racks_for_tip_size(settings, size))
+    resuspend_cursor = cursors[settings.resuspend_tip_ul]
+    mastermix_cursor = cursors[settings.mastermix_tip_ul]
+    dna_cursor = cursors[settings.dna_tip_ul]
+    resuspend_max = TIP_MAX_UL[settings.resuspend_tip_ul]
+    dna_max = TIP_MAX_UL[settings.dna_tip_ul]
 
     if settings.do_resuspend:
+        max_resuspend = max(t.resuspend_ul for t in plan.transfers)
+        if max_resuspend > resuspend_max:
+            raise ValueError(
+                f"Resuspend volume {max_resuspend:.1f} µL exceeds {settings.resuspend_tip_ul} µL tips."
+            )
         log("Resuspending DNA to normalized concentration...")
         for group in group_by_source_column(plan.transfers):
             rows = [t.source_row for t in group]
@@ -732,7 +825,7 @@ async def run_protocol(lh, plan: RunPlan, log: LogFn = print) -> None:
             wells = _wells(dna_plate, [t.source_well for t in group])
             log(
                 f"  water -> DNA {group[0].source_well}-{group[-1].source_well} "
-                f"({min(vols):.1f}-{max(vols):.1f} µL)"
+                f"({min(vols):.1f}-{max(vols):.1f} µL, {settings.resuspend_tip_ul} µL tips)"
             )
             await _pick_column_tips(lh, resuspend_cursor, rows, channels)
             await lh.aspirate(
@@ -755,11 +848,12 @@ async def run_protocol(lh, plan: RunPlan, log: LogFn = print) -> None:
                 channels,
                 settings.resuspend_mix_cycles,
                 settings.water_flow_rate,
+                resuspend_max,
             )
             await lh.discard_tips()
 
     if settings.do_mastermix:
-        log("Dispensing cell-free mastermix...")
+        log("Dispensing cell-free mastermix from 2 mL tube (sequential aspirate)...")
         mm_tips_loaded = False
         mm_rows: list[str] = []
         for group in group_dest_columns(plan.transfers):
@@ -769,23 +863,19 @@ async def run_protocol(lh, plan: RunPlan, log: LogFn = print) -> None:
             wells = _wells(plate, [t.dest_well for t in group])
             vols = [t.mastermix_vol_ul for t in group]
             if not mm_tips_loaded:
-                await _pick_column_tips(lh, transfer_cursor, rows, channels)
+                await _pick_column_tips(lh, mastermix_cursor, rows, channels)
                 mm_tips_loaded = True
                 mm_rows = rows
             elif rows != mm_rows:
                 await lh.discard_tips()
-                await _pick_column_tips(lh, transfer_cursor, rows, channels)
+                await _pick_column_tips(lh, mastermix_cursor, rows, channels)
                 mm_rows = rows
             log(
                 f"  mastermix -> {group[0].dest_plate_title} "
-                f"{group[0].dest_well}-{group[-1].dest_well} ({vols[0]} µL)"
+                f"{group[0].dest_well}-{group[-1].dest_well} ({vols[0]} µL, sequential)"
             )
-            await lh.aspirate(
-                [mastermix] * len(channels),
-                vols=vols,
-                use_channels=channels,
-                flow_rates=[settings.mastermix_flow_rate] * len(group),
-                spread="wide",
+            await _aspirate_tube_sequential(
+                lh, mastermix, vols, channels, settings.mastermix_flow_rate
             )
             await lh.dispense(
                 wells,
@@ -801,7 +891,7 @@ async def run_protocol(lh, plan: RunPlan, log: LogFn = print) -> None:
         for group in split_parallel_transfers(plan.transfers):
             src_rows = [t.source_row for t in group]
             channels = _spaced_channels(src_rows)
-            await _pick_column_tips(lh, transfer_cursor, src_rows, channels)
+            await _pick_column_tips(lh, dna_cursor, src_rows, channels)
             src_wells = _wells(dna_plate, [t.source_well for t in group])
             dest_plate = lh.deck.get_resource(group[0].dest_plate)
             dest_wells = _wells(dest_plate, [t.dest_well for t in group])
@@ -810,18 +900,27 @@ async def run_protocol(lh, plan: RunPlan, log: LogFn = print) -> None:
             log(
                 f"  DNA {group[0].source_well}-{group[-1].source_well} -> "
                 f"{group[0].dest_plate_title} {group[0].dest_well}-{group[-1].dest_well} "
-                f"({vols[0]} µL)"
+                f"({vols[0]} µL, {settings.dna_tip_ul} µL tips)"
             )
             await lh.aspirate(src_wells, vols=vols, use_channels=channels, flow_rates=rates)
+            blowout = min(3.0, max(1.0, dna_max - vols[0] - 1.0))
             await lh.dispense(
                 dest_wells,
                 vols=vols,
                 use_channels=channels,
                 flow_rates=rates,
-                blow_out_air_volume=[5] * len(group),
+                blow_out_air_volume=[blowout] * len(group),
             )
             dest_total = [t.dna_vol_ul + t.mastermix_vol_ul for t in group]
-            await _mix(lh, dest_wells, dest_total, channels, settings.dest_mix_cycles, settings.dna_flow_rate)
+            await _mix(
+                lh,
+                dest_wells,
+                dest_total,
+                channels,
+                settings.dest_mix_cycles,
+                settings.dna_flow_rate,
+                dna_max,
+            )
             await lh.discard_tips()
 
     log("Protocol complete.")
@@ -856,7 +955,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Preview a cell-free Gator worklist.")
     parser.add_argument("platemap")
     parser.add_argument("gatorsetup")
-    parser.add_argument("--ng-ul", type=float, default=10.0)
+    parser.add_argument("--ng-ul", type=float, default=40.0)
     parser.add_argument("--nM", type=float, default=None)
     args = parser.parse_args()
     cfg = Settings(target_concentration=args.ng_ul)
