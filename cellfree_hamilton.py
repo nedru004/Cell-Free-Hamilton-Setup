@@ -7,6 +7,7 @@ DNA into the named Gator wells.
 
 from __future__ import annotations
 
+import asyncio
 import csv
 import io
 import re
@@ -45,8 +46,23 @@ class Settings:
     resuspend_mix_cycles: int = 5
     dest_mix_cycles: int = 3
     water_flow_rate: float = 100.0
+    resuspend_dispense_flow_rate: float = 30.0
+    resuspend_mix_flow_rate: float = 30.0
+    resuspend_dispense_height_mm: float = 4.0
+    resuspend_settle_s: float = 2.0
     mastermix_flow_rate: float = 50.0
-    dna_flow_rate: float = 80.0
+    mastermix_lld: bool = True
+    mastermix_immersion_mm: float = 2.0
+    mastermix_lld_sensitivity: int = 2  # 1 = high, 4 = low
+    # 2 mL tubes sit higher in the 1.5 mL 32-position insert than the carrier model.
+    mastermix_tube_z_offset_mm: float = 18.0
+    mastermix_min_height_mm: float = 5.0
+    dna_flow_rate: float = 40.0
+    dna_lld: bool = True
+    dna_immersion_mm: float = 1.0
+    dna_lld_sensitivity: int = 1  # 1 = high; small volumes
+    dna_min_height_mm: float = 0.3
+    dna_aspirate_xy_offset_mm: float = 1.2
     do_resuspend: bool = True
     do_mastermix: bool = True
     do_dna_transfer: bool = True
@@ -221,6 +237,26 @@ def validate_settings(settings: Settings) -> None:
         raise ValueError("DNA volume exceeds the selected DNA tip size.")
     if settings.mastermix_vol_ul > TIP_MAX_UL[settings.mastermix_tip_ul]:
         raise ValueError("Mastermix volume exceeds the selected mastermix tip size.")
+    if not 1 <= settings.mastermix_lld_sensitivity <= 4:
+        raise ValueError("Mastermix cLLD sensitivity must be 1 (high) through 4 (low).")
+    if settings.mastermix_immersion_mm <= 0:
+        raise ValueError("Mastermix immersion depth must be greater than 0 mm.")
+    if not 0 <= settings.mastermix_tube_z_offset_mm <= 40:
+        raise ValueError("Mastermix tube Z offset must be between 0 and 40 mm.")
+    if settings.mastermix_min_height_mm < 2:
+        raise ValueError("Mastermix minimum height above tube bottom must be at least 2 mm.")
+    if settings.resuspend_dispense_flow_rate <= 0 or settings.resuspend_mix_flow_rate <= 0:
+        raise ValueError("Resuspend dispense and mix flow rates must be greater than 0.")
+    if settings.resuspend_dispense_height_mm < 0:
+        raise ValueError("Resuspend dispense height cannot be negative.")
+    if settings.resuspend_settle_s < 0:
+        raise ValueError("Resuspend settle time cannot be negative.")
+    if not 1 <= settings.dna_lld_sensitivity <= 4:
+        raise ValueError("DNA cLLD sensitivity must be 1 (high) through 4 (low).")
+    if settings.dna_immersion_mm <= 0:
+        raise ValueError("DNA immersion depth must be greater than 0 mm.")
+    if settings.dna_min_height_mm < 0:
+        raise ValueError("DNA minimum height above well bottom cannot be negative.")
 
 
 def _as_bytes(source: FileInput) -> bytes:
@@ -569,11 +605,25 @@ def format_plan(plan: RunPlan) -> str:
         f"Shared names: {len(shared)}",
         f"Reactions: {len(plan.transfers)} (dilution + cell-free only for shared names)",
         f"Gator plates: {', '.join(plan.gator_titles) or '(none)'}",
-        f"DNA transfer: {plan.settings.dna_vol_ul} µL",
+        f"DNA transfer: {plan.settings.dna_vol_ul} µL"
+        + (" with cLLD (skip bottom bubbles)" if plan.settings.dna_lld else ""),
+        f"Resuspend: slow dispense from {plan.settings.resuspend_dispense_height_mm:.0f} mm, "
+        f"gentle mix, {plan.settings.resuspend_settle_s:.0f} s settle",
         f"Mastermix: {plan.settings.mastermix_vol_ul} µL",
         f"Target: {plan.settings.target_concentration} {plan.settings.concentration_unit}",
         f"Water needed (with 15% extra): {plan.water_ul:.0f} µL in the water trough",
         f"Mastermix needed (with 15% extra): {plan.mastermix_ul:.0f} µL in a 2 mL tube",
+        (
+            f"Mastermix aspiration: cLLD, {plan.settings.mastermix_immersion_mm:.1f} mm below surface; "
+            f"tube Z +{plan.settings.mastermix_tube_z_offset_mm:.0f} mm, "
+            f"min height {plan.settings.mastermix_min_height_mm:.0f} mm above bottom"
+            if plan.settings.mastermix_lld
+            else (
+                f"Mastermix aspiration: fixed height; "
+                f"tube Z +{plan.settings.mastermix_tube_z_offset_mm:.0f} mm, "
+                f"min height {plan.settings.mastermix_min_height_mm:.0f} mm above bottom"
+            )
+        ),
         f"Tips: resuspend {plan.settings.resuspend_tip_ul} µL, "
         f"mastermix {plan.settings.mastermix_tip_ul} µL, "
         f"DNA {plan.settings.dna_tip_ul} µL",
@@ -710,6 +760,7 @@ def setup_deck(settings: Settings):
     from pylabrobot.resources import (
         PLT_CAR_L5AC_A00,
         TIP_CAR_480_A00,
+        Coordinate,
         Cor_96_wellplate_360ul_Fb,
         hamilton_96_tiprack_10uL_filter,
         hamilton_96_tiprack_50uL_filter,
@@ -756,7 +807,10 @@ def setup_deck(settings: Settings):
     lh.deck.assign_child_resource(trough_car, rails=settings.trough_carrier_rail)
 
     tube_car = hamilton_tube_carrier_32_a00_insert_eppendorf_1_5mL(name="tube_carrier")
-    tube_car[settings.mastermix_tube_site] = Eppendorf_DNA_LoBind_2ml_Ub(name="mastermix_tube")
+    tube_car[settings.mastermix_tube_site].assign_child_resource(
+        Eppendorf_DNA_LoBind_2ml_Ub(name="mastermix_tube"),
+        location=Coordinate(0, 0, settings.mastermix_tube_z_offset_mm),
+    )
     lh.deck.assign_child_resource(tube_car, rails=settings.tube_carrier_rail)
 
     return lh
@@ -799,27 +853,114 @@ async def _mix(
     cycles: int,
     flow_rate: float,
     tip_max_ul: float,
+    mix_fraction: float = 0.4,
+    leave_ul: float = 2.0,
 ):
+    """Mix without emptying the well, which traps air bubbles at the bottom."""
     if cycles <= 0:
         return
     mix_vols = [
-        max(1.0, min(v * 0.6, tip_max_ul * 0.8, v - 1.0 if v > 3 else v))
+        max(1.0, min(v * mix_fraction, tip_max_ul * 0.8, max(1.0, v - leave_ul)))
         for v in vols
     ]
     rates = [flow_rate] * len(wells)
+    settle = [0.4] * len(wells)
     for _ in range(cycles):
-        await lh.aspirate(wells, vols=mix_vols, use_channels=channels, flow_rates=rates)
-        await lh.dispense(wells, vols=mix_vols, use_channels=channels, flow_rates=rates)
+        await lh.aspirate(
+            wells,
+            vols=mix_vols,
+            use_channels=channels,
+            flow_rates=rates,
+            settling_time=settle,
+        )
+        await lh.dispense(
+            wells,
+            vols=mix_vols,
+            use_channels=channels,
+            flow_rates=rates,
+            settling_time=settle,
+        )
 
 
-async def _aspirate_tube_sequential(lh, tube, vols: list[float], channels: list[int], flow_rate: float):
-    """Aspirate from one 2 mL tube one channel at a time."""
+def _mastermix_aspirate_kwargs(lh, tube, settings: Settings) -> dict:
+    """Keep the tip above the physical tube bottom, then cLLD to the surface.
+
+    The 32-position carrier model is for 1.5 mL inserts. A 2 mL tube sits higher, so
+    the modeled cavity bottom is raised by mastermix_tube_z_offset_mm. minimum_height
+    is an additional floor so LLD cannot search into the plastic if detection misses.
+    """
+    cavity_bottom = tube.get_location_wrt(lh.deck).z + tube.material_z_thickness
+    min_z = cavity_bottom + settings.mastermix_min_height_mm
+    kwargs: dict = {
+        "liquid_height": [settings.mastermix_min_height_mm],
+        "minimum_height": [min_z],
+    }
+    if not settings.mastermix_lld:
+        return kwargs
+    try:
+        from pylabrobot.liquid_handling.backends.hamilton.STAR_backend import STARBackend
+    except ImportError:
+        return kwargs
+    if not isinstance(lh.backend, STARBackend):
+        return kwargs
+    kwargs.update(
+        {
+            "lld_mode": [STARBackend.LLDMode.GAMMA],
+            "immersion_depth": [settings.mastermix_immersion_mm],
+            "gamma_lld_sensitivity": [settings.mastermix_lld_sensitivity],
+        }
+    )
+    return kwargs
+
+
+def _dna_aspirate_kwargs(lh, wells, settings: Settings) -> dict:
+    """Find liquid instead of a bottom-center air bubble."""
+    from pylabrobot.resources import Coordinate
+
+    n = len(wells)
+    kwargs: dict = {
+        "liquid_height": [settings.dna_min_height_mm] * n,
+        "offsets": [Coordinate(settings.dna_aspirate_xy_offset_mm, 0, 0) for _ in wells],
+    }
+    try:
+        from pylabrobot.liquid_handling.backends.hamilton.STAR_backend import STARBackend
+    except ImportError:
+        return kwargs
+    if not isinstance(lh.backend, STARBackend):
+        return kwargs
+    bottoms = [
+        well.get_location_wrt(lh.deck).z + well.material_z_thickness for well in wells
+    ]
+    kwargs["minimum_height"] = [bottom + settings.dna_min_height_mm for bottom in bottoms]
+    if settings.dna_lld:
+        kwargs.update(
+            {
+                "lld_mode": [STARBackend.LLDMode.GAMMA] * n,
+                "immersion_depth": [settings.dna_immersion_mm] * n,
+                "gamma_lld_sensitivity": [settings.dna_lld_sensitivity] * n,
+            }
+        )
+    return kwargs
+
+
+async def _aspirate_tube_sequential(
+    lh,
+    tube,
+    vols: list[float],
+    channels: list[int],
+    flow_rate: float,
+    settings: Optional[Settings] = None,
+):
+    """Aspirate from one 2 mL tube one channel at a time, using cLLD when available."""
+    settings = settings or Settings()
+    lld_kwargs = _mastermix_aspirate_kwargs(lh, tube, settings)
     for vol, channel in zip(vols, channels):
         await lh.aspirate(
             [tube],
             vols=[vol],
             use_channels=[channel],
             flow_rates=[flow_rate],
+            **lld_kwargs,
         )
 
 
@@ -858,7 +999,7 @@ async def run_protocol(lh, plan: RunPlan, log: LogFn = print) -> None:
             raise ValueError(
                 f"Resuspend volume {max_resuspend:.1f} µL exceeds {settings.resuspend_tip_ul} µL tips."
             )
-        log("Resuspending DNA to normalized concentration...")
+        log("Resuspending DNA to normalized concentration (slow dispense, gentle mix)...")
         for group in group_by_source_column(plan.transfers):
             rows = [t.source_row for t in group]
             channels = _spaced_channels(rows)
@@ -880,7 +1021,8 @@ async def run_protocol(lh, plan: RunPlan, log: LogFn = print) -> None:
                 wells,
                 vols=vols,
                 use_channels=channels,
-                flow_rates=[settings.water_flow_rate] * len(group),
+                flow_rates=[settings.resuspend_dispense_flow_rate] * len(group),
+                liquid_height=[settings.resuspend_dispense_height_mm] * len(group),
             )
             await _mix(
                 lh,
@@ -888,13 +1030,27 @@ async def run_protocol(lh, plan: RunPlan, log: LogFn = print) -> None:
                 vols,
                 channels,
                 settings.resuspend_mix_cycles,
-                settings.water_flow_rate,
+                settings.resuspend_mix_flow_rate,
                 resuspend_max,
             )
+            if settings.resuspend_settle_s > 0:
+                await asyncio.sleep(settings.resuspend_settle_s)
             await lh.discard_tips()
 
     if settings.do_mastermix:
-        log("Dispensing cell-free mastermix from 2 mL tube (sequential aspirate)...")
+        if settings.mastermix_lld:
+            log(
+                "Dispensing cell-free mastermix from 2 mL tube "
+                f"(cLLD, {settings.mastermix_immersion_mm:.1f} mm below surface, "
+                f"Z floor +{settings.mastermix_tube_z_offset_mm:.0f} mm / "
+                f"{settings.mastermix_min_height_mm:.0f} mm above bottom)..."
+            )
+        else:
+            log(
+                "Dispensing cell-free mastermix from 2 mL tube "
+                f"(no LLD, Z floor +{settings.mastermix_tube_z_offset_mm:.0f} mm / "
+                f"{settings.mastermix_min_height_mm:.0f} mm above bottom)..."
+            )
         mm_tips_loaded = False
         mm_rows: list[str] = []
         for group in group_dest_columns(plan.transfers):
@@ -916,7 +1072,7 @@ async def run_protocol(lh, plan: RunPlan, log: LogFn = print) -> None:
                 f"{group[0].dest_well}-{group[-1].dest_well} ({vols[0]} µL, sequential)"
             )
             await _aspirate_tube_sequential(
-                lh, mastermix, vols, channels, settings.mastermix_flow_rate
+                lh, mastermix, vols, channels, settings.mastermix_flow_rate, settings
             )
             await lh.dispense(
                 wells,
@@ -941,9 +1097,16 @@ async def run_protocol(lh, plan: RunPlan, log: LogFn = print) -> None:
             log(
                 f"  DNA {group[0].source_well}-{group[-1].source_well} -> "
                 f"{group[0].dest_plate_title} {group[0].dest_well}-{group[-1].dest_well} "
-                f"({vols[0]} µL, {settings.dna_tip_ul} µL tips)"
+                f"({vols[0]} µL, {settings.dna_tip_ul} µL tips"
+                f"{', cLLD' if settings.dna_lld else ''})"
             )
-            await lh.aspirate(src_wells, vols=vols, use_channels=channels, flow_rates=rates)
+            await lh.aspirate(
+                src_wells,
+                vols=vols,
+                use_channels=channels,
+                flow_rates=rates,
+                **_dna_aspirate_kwargs(lh, src_wells, settings),
+            )
             blowout = min(3.0, max(1.0, dna_max - vols[0] - 1.0))
             await lh.dispense(
                 dest_wells,
