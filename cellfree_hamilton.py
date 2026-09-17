@@ -660,20 +660,36 @@ def group_dest_columns(transfers: list[Transfer]) -> list[list[Transfer]]:
 # ---------------------------------------------------------------------------
 
 class TipCursor:
+    """Allocate unused tips without skipping leftover rows in a column."""
+
     def __init__(self, rack_names: list[str]):
         self.rack_names = rack_names
-        self.rack_index = 0
-        self.col = 1
+        self.used: set[tuple[str, int, str]] = set()
 
-    def consume_column(self) -> tuple[str, int]:
-        if self.col > 12:
-            self.rack_index += 1
-            self.col = 1
-        if self.rack_index >= len(self.rack_names):
-            raise RuntimeError("Out of tips. Add another tip rack on the tip carrier.")
-        rack, col = self.rack_names[self.rack_index], self.col
-        self.col += 1
-        return rack, col
+    def allocate(self, channels: list[int]) -> tuple[str, int, list[str]]:
+        if not channels:
+            raise ValueError("Need at least one channel to allocate tips.")
+        offsets = [channel - channels[0] for channel in channels]
+        for rack_name in self.rack_names:
+            for col in range(1, 13):
+                for start in range(8):
+                    rows: list[str] = []
+                    fits = True
+                    for offset in offsets:
+                        idx = start + offset
+                        if idx >= 8:
+                            fits = False
+                            break
+                        row = ROWS[idx]
+                        if (rack_name, col, row) in self.used:
+                            fits = False
+                            break
+                        rows.append(row)
+                    if fits and len(rows) == len(channels):
+                        for row in rows:
+                            self.used.add((rack_name, col, row))
+                        return rack_name, col, rows
+        raise RuntimeError("Out of tips. Add another tip rack on the tip carrier.")
 
 
 def setup_deck(settings: Settings):
@@ -756,12 +772,12 @@ def _spaced_channels(rows: list[str]) -> list[int]:
     return [idx - base for idx in indexes]
 
 
-async def _pick_column_tips(lh, cursor: TipCursor, rows: list[str], channels: list[int]):
-    rack_name, col = cursor.consume_column()
+async def _pick_tips(lh, cursor: TipCursor, channels: list[int]):
+    rack_name, col, tip_rows = cursor.allocate(channels)
     rack = lh.deck.get_resource(rack_name)
-    spots = [rack.get_item(f"{row}{col}") for row in rows]
+    spots = [rack.get_item(f"{row}{col}") for row in tip_rows]
     await lh.pick_up_tips(spots, use_channels=channels)
-    return rack_name, col
+    return rack_name, col, tip_rows
 
 
 async def _mix(
@@ -827,7 +843,7 @@ async def run_protocol(lh, plan: RunPlan, log: LogFn = print) -> None:
                 f"  water -> DNA {group[0].source_well}-{group[-1].source_well} "
                 f"({min(vols):.1f}-{max(vols):.1f} µL, {settings.resuspend_tip_ul} µL tips)"
             )
-            await _pick_column_tips(lh, resuspend_cursor, rows, channels)
+            await _pick_tips(lh, resuspend_cursor, channels)
             await lh.aspirate(
                 [water] * len(channels),
                 vols=vols,
@@ -863,12 +879,12 @@ async def run_protocol(lh, plan: RunPlan, log: LogFn = print) -> None:
             wells = _wells(plate, [t.dest_well for t in group])
             vols = [t.mastermix_vol_ul for t in group]
             if not mm_tips_loaded:
-                await _pick_column_tips(lh, mastermix_cursor, rows, channels)
+                await _pick_tips(lh, mastermix_cursor, channels)
                 mm_tips_loaded = True
                 mm_rows = rows
             elif rows != mm_rows:
                 await lh.discard_tips()
-                await _pick_column_tips(lh, mastermix_cursor, rows, channels)
+                await _pick_tips(lh, mastermix_cursor, channels)
                 mm_rows = rows
             log(
                 f"  mastermix -> {group[0].dest_plate_title} "
@@ -891,7 +907,7 @@ async def run_protocol(lh, plan: RunPlan, log: LogFn = print) -> None:
         for group in split_parallel_transfers(plan.transfers):
             src_rows = [t.source_row for t in group]
             channels = _spaced_channels(src_rows)
-            await _pick_column_tips(lh, dna_cursor, src_rows, channels)
+            await _pick_tips(lh, dna_cursor, channels)
             src_wells = _wells(dna_plate, [t.source_well for t in group])
             dest_plate = lh.deck.get_resource(group[0].dest_plate)
             dest_wells = _wells(dest_plate, [t.dest_well for t in group])
