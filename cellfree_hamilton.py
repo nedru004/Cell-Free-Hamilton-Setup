@@ -62,11 +62,14 @@ class Settings:
     mastermix_tube_z_offset_mm: float = 8.0
     mastermix_min_height_mm: float = 3.0
     mastermix_aspirate_x_offset_mm: float = -1.0
+    mastermix_max_aliquots: int = 12
+    mastermix_aliquot_headroom_ul: float = 20.0
     dna_flow_rate: float = 40.0
     dna_lld: bool = True
-    dna_immersion_mm: float = 1.0
+    dna_immersion_mm: float = 0.4
     dna_lld_sensitivity: int = 1  # 1 = high; small volumes
-    dna_min_height_mm: float = 0.3
+    dna_min_height_mm: float = 0.2
+    dna_lld_search_height_mm: float = 2.5  # start LLD near the well floor, not the rim
     dna_aspirate_xy_offset_mm: float = 1.2
     do_resuspend: bool = True
     do_mastermix: bool = True
@@ -262,12 +265,18 @@ def validate_settings(settings: Settings) -> None:
         raise ValueError("DNA immersion depth must be greater than 0 mm.")
     if settings.dna_min_height_mm < 0:
         raise ValueError("DNA minimum height above well bottom cannot be negative.")
+    if not 0.5 <= settings.dna_lld_search_height_mm <= 12:
+        raise ValueError("DNA LLD search height must be between 0.5 and 12 mm above the well bottom.")
+    if settings.dna_lld_search_height_mm <= settings.dna_min_height_mm:
+        raise ValueError("DNA LLD search height must be above the DNA minimum height.")
     if not 1 <= settings.water_lld_sensitivity <= 4:
         raise ValueError("Water cLLD sensitivity must be 1 (high) through 4 (low).")
     if settings.water_immersion_mm <= 0:
         raise ValueError("Water immersion depth must be greater than 0 mm.")
     if settings.water_min_height_mm < 0:
         raise ValueError("Water minimum height above trough bottom cannot be negative.")
+    if settings.mastermix_max_aliquots < 1:
+        raise ValueError("Mastermix wells per pickup must be at least 1.")
 
 
 def _as_bytes(source: FileInput) -> bytes:
@@ -617,7 +626,11 @@ def format_plan(plan: RunPlan) -> str:
         f"Reactions: {len(plan.transfers)} (dilution + cell-free only for shared names)",
         f"Gator plates: {', '.join(plan.gator_titles) or '(none)'}",
         f"DNA transfer: {plan.settings.dna_vol_ul} µL"
-        + (" with cLLD (skip bottom bubbles)" if plan.settings.dna_lld else ""),
+        + (
+            f" with cLLD from {plan.settings.dna_lld_search_height_mm:.1f} mm above well bottom"
+            if plan.settings.dna_lld
+            else ""
+        ),
         f"Resuspend: slow dispense from {plan.settings.resuspend_dispense_height_mm:.0f} mm, "
         f"gentle mix, {plan.settings.resuspend_settle_s:.0f} s settle"
         + (", water trough cLLD" if plan.settings.water_lld else ""),
@@ -628,12 +641,14 @@ def format_plan(plan: RunPlan) -> str:
         (
             f"Mastermix aspiration: cLLD, {plan.settings.mastermix_immersion_mm:.1f} mm below surface; "
             f"tube Z +{plan.settings.mastermix_tube_z_offset_mm:.0f} mm, "
-            f"min height {plan.settings.mastermix_min_height_mm:.0f} mm above bottom"
+            f"min height {plan.settings.mastermix_min_height_mm:.0f} mm above bottom; "
+            f"up to {plan.settings.mastermix_max_aliquots} wells per pickup"
             if plan.settings.mastermix_lld
             else (
                 f"Mastermix aspiration: fixed height; "
                 f"tube Z +{plan.settings.mastermix_tube_z_offset_mm:.0f} mm, "
-                f"min height {plan.settings.mastermix_min_height_mm:.0f} mm above bottom"
+                f"min height {plan.settings.mastermix_min_height_mm:.0f} mm above bottom; "
+                f"up to {plan.settings.mastermix_max_aliquots} wells per pickup"
             )
         ),
         f"Tips: resuspend {plan.settings.resuspend_tip_ul} µL, "
@@ -726,6 +741,44 @@ def group_dest_columns(transfers: list[Transfer]) -> list[list[Transfer]]:
         sorted(group, key=lambda t: _row_index(t.dest_well))
         for _, group in sorted(columns.items())
     ]
+
+
+def _dest_rows(group: list[Transfer]) -> list[str]:
+    return [t.dest_row for t in group]
+
+
+def chunk_mastermix_groups(groups: list[list[Transfer]]) -> list[list[list[Transfer]]]:
+    """Keep consecutive dest columns together when they share the same rows/channels."""
+    chunks: list[list[list[Transfer]]] = []
+    current: list[list[Transfer]] = []
+    current_rows: Optional[list[str]] = None
+    for group in groups:
+        rows = _dest_rows(group)
+        if current_rows is None or rows == current_rows:
+            current.append(group)
+            current_rows = rows
+        else:
+            chunks.append(current)
+            current = [group]
+            current_rows = rows
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def split_aliquot_batches(
+    groups: list[list[Transfer]],
+    tip_max_ul: float,
+    max_aliquots: int,
+    headroom_ul: float,
+) -> list[list[list[Transfer]]]:
+    """Split a same-row chunk into pickups that fit in the tip."""
+    if not groups:
+        return []
+    well_vol = max(t.mastermix_vol_ul for t in groups[0])
+    fit = max(1, int((tip_max_ul - headroom_ul) // well_vol)) if well_vol > 0 else 1
+    size = max(1, min(max_aliquots, fit, len(groups)))
+    return [groups[i : i + size] for i in range(0, len(groups), size)]
 
 
 # ---------------------------------------------------------------------------
@@ -979,6 +1032,7 @@ def _dna_aspirate_kwargs(lh, wells, settings: Settings) -> dict:
         kwargs.update(
             {
                 "lld_mode": [STARBackend.LLDMode.GAMMA] * n,
+                "lld_search_height": [settings.dna_lld_search_height_mm] * n,
                 "immersion_depth": [settings.dna_immersion_mm] * n,
                 "gamma_lld_sensitivity": [settings.dna_lld_sensitivity] * n,
             }
@@ -1101,12 +1155,10 @@ async def run_protocol(lh, plan: RunPlan, log: LogFn = print) -> None:
             )
         mm_tips_loaded = False
         mm_rows: list[str] = []
-        for group in group_dest_columns(plan.transfers):
-            rows = [t.dest_row for t in group]
+        mm_max = TIP_MAX_UL[settings.mastermix_tip_ul]
+        for chunk in chunk_mastermix_groups(group_dest_columns(plan.transfers)):
+            rows = _dest_rows(chunk[0])
             channels = _spaced_channels(rows)
-            plate = lh.deck.get_resource(group[0].dest_plate)
-            wells = _wells(plate, [t.dest_well for t in group])
-            vols = [t.mastermix_vol_ul for t in group]
             if not mm_tips_loaded:
                 await _pick_tips(lh, mastermix_cursor, channels)
                 mm_tips_loaded = True
@@ -1115,19 +1167,48 @@ async def run_protocol(lh, plan: RunPlan, log: LogFn = print) -> None:
                 await lh.discard_tips()
                 await _pick_tips(lh, mastermix_cursor, channels)
                 mm_rows = rows
-            log(
-                f"  mastermix -> {group[0].dest_plate_title} "
-                f"{group[0].dest_well}-{group[-1].dest_well} ({vols[0]} µL, sequential)"
-            )
-            await _aspirate_tube_sequential(
-                lh, mastermix, vols, channels, settings.mastermix_flow_rate, settings
-            )
-            await lh.dispense(
-                wells,
-                vols=vols,
-                use_channels=channels,
-                flow_rates=[settings.mastermix_flow_rate] * len(group),
-            )
+            for batch in split_aliquot_batches(
+                chunk,
+                mm_max,
+                settings.mastermix_max_aliquots,
+                settings.mastermix_aliquot_headroom_ul,
+            ):
+                pickup_vols = [
+                    sum(group[idx].mastermix_vol_ul for group in batch)
+                    for idx in range(len(batch[0]))
+                ]
+                if max(pickup_vols) > mm_max:
+                    raise ValueError(
+                        f"Mastermix pickup {max(pickup_vols):.1f} µL exceeds "
+                        f"{settings.mastermix_tip_ul} µL tips."
+                    )
+                log(
+                    f"  aspirate {pickup_vols[0]:.0f} µL/channel from 2 mL tube "
+                    f"({len(batch)} wells each, {len(channels)} channels)"
+                )
+                await _aspirate_tube_sequential(
+                    lh, mastermix, pickup_vols, channels, settings.mastermix_flow_rate, settings
+                )
+                for step, group in enumerate(batch):
+                    plate = lh.deck.get_resource(group[0].dest_plate)
+                    wells = _wells(plate, [t.dest_well for t in group])
+                    vols = [t.mastermix_vol_ul for t in group]
+                    last = step == len(batch) - 1
+                    blowout = min(5.0, max(1.0, mm_max - vols[0] - 1.0)) if last else 0.0
+                    log(
+                        f"    dispense {vols[0]:.0f} µL -> {group[0].dest_plate_title} "
+                        f"{group[0].dest_well}-{group[-1].dest_well}"
+                    )
+                    dispense_kwargs = {}
+                    if last:
+                        dispense_kwargs["blow_out_air_volume"] = [blowout] * len(group)
+                    await lh.dispense(
+                        wells,
+                        vols=vols,
+                        use_channels=channels,
+                        flow_rates=[settings.mastermix_flow_rate] * len(group),
+                        **dispense_kwargs,
+                    )
         if mm_tips_loaded:
             await lh.discard_tips()
 
