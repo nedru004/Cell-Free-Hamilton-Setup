@@ -65,7 +65,7 @@ class Settings:
     mastermix_max_aliquots: int = 12
     mastermix_aliquot_headroom_ul: float = 20.0
     dna_flow_rate: float = 40.0
-    dna_lld: bool = True
+    dna_lld: bool = False
     dna_immersion_mm: float = 0.4
     dna_lld_sensitivity: int = 1  # 1 = high; small volumes
     dna_min_height_mm: float = 0.2
@@ -1014,8 +1014,9 @@ def _dna_aspirate_kwargs(lh, wells, settings: Settings) -> dict:
     from pylabrobot.resources import Coordinate
 
     n = len(wells)
+    height = settings.dna_min_height_mm if settings.dna_lld else 0.0
     kwargs: dict = {
-        "liquid_height": [settings.dna_min_height_mm] * n,
+        "liquid_height": [height] * n,
         "offsets": [Coordinate(settings.dna_aspirate_xy_offset_mm, 0, 0) for _ in wells],
     }
     try:
@@ -1027,7 +1028,7 @@ def _dna_aspirate_kwargs(lh, wells, settings: Settings) -> dict:
     bottoms = [
         well.get_location_wrt(lh.deck).z + well.material_z_thickness for well in wells
     ]
-    kwargs["minimum_height"] = [bottom + settings.dna_min_height_mm for bottom in bottoms]
+    kwargs["minimum_height"] = [bottom + height for bottom in bottoms]
     if settings.dna_lld:
         kwargs.update(
             {
