@@ -504,8 +504,10 @@ def build_plan(
     dests: list[DestWell],
     settings: Optional[Settings] = None,
 ) -> RunPlan:
+    """Plan only names that appear on both the platemap and the Gator sheet."""
     settings = settings or Settings()
     by_name = {sample.name: sample for sample in samples}
+    dest_names = {dest.name for dest in dests}
     transfers: list[Transfer] = []
     unmatched: list[str] = []
 
@@ -537,7 +539,7 @@ def build_plan(
     transfers.sort(key=lambda t: (t.dest_plate, t.dest_col, t.dest_row))
 
     used = {t.name for t in transfers}
-    unused = [sample.name for sample in samples if sample.name not in used]
+    unused = [sample.name for sample in samples if sample.name not in dest_names]
     titles = []
     for dest in dests:
         if dest.plate_title not in titles:
@@ -562,8 +564,10 @@ def build_plan(
 
 
 def format_plan(plan: RunPlan) -> str:
+    shared = sorted({t.name for t in plan.transfers})
     lines = [
-        f"Reactions: {len(plan.transfers)}",
+        f"Shared names: {len(shared)}",
+        f"Reactions: {len(plan.transfers)} (dilution + cell-free only for shared names)",
         f"Gator plates: {', '.join(plan.gator_titles) or '(none)'}",
         f"DNA transfer: {plan.settings.dna_vol_ul} µL",
         f"Mastermix: {plan.settings.mastermix_vol_ul} µL",
@@ -575,9 +579,13 @@ def format_plan(plan: RunPlan) -> str:
         f"DNA {plan.settings.dna_tip_ul} µL",
     ]
     if plan.unmatched_dest_names:
-        lines.append("Unmatched Gator names: " + ", ".join(plan.unmatched_dest_names))
+        lines.append(
+            "Skipped Gator wells (name not in platemap): " + ", ".join(plan.unmatched_dest_names)
+        )
     if plan.unused_dna_names:
-        lines.append(f"DNA wells not used on Gator plates: {len(plan.unused_dna_names)}")
+        lines.append(
+            "Skipped platemap DNA (name not in gatorsetup): " + ", ".join(plan.unused_dna_names)
+        )
     lines.append("")
     lines.append(
         f"{'Name':<16} {'Src':<5} {'Dest plate':<16} {'Dest':<5} "
@@ -829,6 +837,20 @@ async def run_protocol(lh, plan: RunPlan, log: LogFn = print) -> None:
     dna_cursor = cursors[settings.dna_tip_ul]
     resuspend_max = TIP_MAX_UL[settings.resuspend_tip_ul]
     dna_max = TIP_MAX_UL[settings.dna_tip_ul]
+    shared = {t.name for t in plan.transfers}
+    log(
+        f"Running {len(plan.transfers)} reactions for {len(shared)} names shared by both sheets."
+    )
+    if plan.unused_dna_names:
+        log(
+            f"Skipping {len(plan.unused_dna_names)} platemap names not in gatorsetup "
+            "(no dilution or cell-free)."
+        )
+    if plan.unmatched_dest_names:
+        log(
+            f"Skipping {len(plan.unmatched_dest_names)} gatorsetup wells not in platemap "
+            "(no dilution or cell-free)."
+        )
 
     if settings.do_resuspend:
         max_resuspend = max(t.resuspend_ul for t in plan.transfers)
@@ -951,12 +973,10 @@ def load_run(platemap: FileInput, gatorsetup: FileInput, settings: Optional[Sett
     samples = parse_platemap(platemap, filename=platemap_name)
     dests = parse_gatorsetup(gatorsetup)
     plan = build_plan(samples, dests, settings)
-    if plan.unmatched_dest_names:
-        raise ValueError(
-            "Gator names not found in platemap: " + ", ".join(plan.unmatched_dest_names)
-        )
     if not plan.transfers:
-        raise ValueError("No matched samples to run.")
+        raise ValueError(
+            "No shared names between the platemap and gatorsetup sheets."
+        )
     return plan
 
 
