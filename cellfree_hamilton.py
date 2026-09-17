@@ -15,6 +15,9 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import BinaryIO, Callable, Iterable, Optional, Union
+import sys 
+
+sys.path.insert(0, r"C:\Users\16122\Documents\Github\pylabrobot")
 
 ROWS = "ABCDEFGH"
 ROW_TO_CHANNEL = {row: idx for idx, row in enumerate(ROWS)}
