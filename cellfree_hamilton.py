@@ -59,9 +59,9 @@ class Settings:
     mastermix_immersion_mm: float = 2.0
     mastermix_lld_sensitivity: int = 2  # 1 = high, 4 = low
     # 2 mL tubes sit higher in the 1.5 mL 32-position insert than the carrier model.
-    mastermix_tube_z_offset_mm: float = 10.0
-    mastermix_min_height_mm: float = 5.0
-    mastermix_aspirate_x_offset_mm: float = -2.0
+    mastermix_tube_z_offset_mm: float = 8.0
+    mastermix_min_height_mm: float = 3.0
+    mastermix_aspirate_x_offset_mm: float = -1.0
     dna_flow_rate: float = 40.0
     dna_lld: bool = True
     dna_immersion_mm: float = 1.0
