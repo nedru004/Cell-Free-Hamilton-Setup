@@ -41,11 +41,15 @@ class Settings:
     mastermix_vol_ul: float = 16.0
     target_concentration: float = 40.0
     concentration_unit: str = "ng/uL"  # "ng/uL" or "nM"
-    min_resuspend_ul: float = 5.0
+    min_resuspend_ul: float = 10.0
     max_resuspend_ul: float = 120.0
-    resuspend_mix_cycles: int = 5
+    resuspend_mix_cycles: int = 3
     dest_mix_cycles: int = 3
     water_flow_rate: float = 100.0
+    water_lld: bool = True
+    water_immersion_mm: float = 2.0
+    water_lld_sensitivity: int = 1  # water is weakly conductive
+    water_min_height_mm: float = 1.5
     resuspend_dispense_flow_rate: float = 30.0
     resuspend_mix_flow_rate: float = 30.0
     resuspend_dispense_height_mm: float = 4.0
@@ -55,7 +59,7 @@ class Settings:
     mastermix_immersion_mm: float = 2.0
     mastermix_lld_sensitivity: int = 2  # 1 = high, 4 = low
     # 2 mL tubes sit higher in the 1.5 mL 32-position insert than the carrier model.
-    mastermix_tube_z_offset_mm: float = 18.0
+    mastermix_tube_z_offset_mm: float = 10.0
     mastermix_min_height_mm: float = 5.0
     dna_flow_rate: float = 40.0
     dna_lld: bool = True
@@ -257,6 +261,12 @@ def validate_settings(settings: Settings) -> None:
         raise ValueError("DNA immersion depth must be greater than 0 mm.")
     if settings.dna_min_height_mm < 0:
         raise ValueError("DNA minimum height above well bottom cannot be negative.")
+    if not 1 <= settings.water_lld_sensitivity <= 4:
+        raise ValueError("Water cLLD sensitivity must be 1 (high) through 4 (low).")
+    if settings.water_immersion_mm <= 0:
+        raise ValueError("Water immersion depth must be greater than 0 mm.")
+    if settings.water_min_height_mm < 0:
+        raise ValueError("Water minimum height above trough bottom cannot be negative.")
 
 
 def _as_bytes(source: FileInput) -> bytes:
@@ -608,7 +618,8 @@ def format_plan(plan: RunPlan) -> str:
         f"DNA transfer: {plan.settings.dna_vol_ul} µL"
         + (" with cLLD (skip bottom bubbles)" if plan.settings.dna_lld else ""),
         f"Resuspend: slow dispense from {plan.settings.resuspend_dispense_height_mm:.0f} mm, "
-        f"gentle mix, {plan.settings.resuspend_settle_s:.0f} s settle",
+        f"gentle mix, {plan.settings.resuspend_settle_s:.0f} s settle"
+        + (", water trough cLLD" if plan.settings.water_lld else ""),
         f"Mastermix: {plan.settings.mastermix_vol_ul} µL",
         f"Target: {plan.settings.target_concentration} {plan.settings.concentration_unit}",
         f"Water needed (with 15% extra): {plan.water_ul:.0f} µL in the water trough",
@@ -913,6 +924,34 @@ def _mastermix_aspirate_kwargs(lh, tube, settings: Settings) -> dict:
     return kwargs
 
 
+def _water_aspirate_kwargs(lh, trough, n: int, settings: Settings) -> dict:
+    """cLLD just below the trough surface so tips are not dunked and shed droplets."""
+    kwargs: dict = {
+        "liquid_height": [settings.water_min_height_mm] * n,
+        "spread": "wide",
+    }
+    if not settings.water_lld:
+        return kwargs
+    try:
+        from pylabrobot.liquid_handling.backends.hamilton.STAR_backend import STARBackend
+    except ImportError:
+        return kwargs
+    if not isinstance(lh.backend, STARBackend):
+        return kwargs
+    cavity_bottom = trough.get_location_wrt(lh.deck).z + trough.material_z_thickness
+    kwargs.update(
+        {
+            "lld_mode": [STARBackend.LLDMode.GAMMA] * n,
+            "immersion_depth": [settings.water_immersion_mm] * n,
+            "gamma_lld_sensitivity": [settings.water_lld_sensitivity] * n,
+            "minimum_height": [cavity_bottom + settings.water_min_height_mm] * n,
+            "swap_speed": [30.0] * n,
+            "settling_time": [0.4] * n,
+        }
+    )
+    return kwargs
+
+
 def _dna_aspirate_kwargs(lh, wells, settings: Settings) -> dict:
     """Find liquid instead of a bottom-center air bubble."""
     from pylabrobot.resources import Coordinate
@@ -999,7 +1038,12 @@ async def run_protocol(lh, plan: RunPlan, log: LogFn = print) -> None:
             raise ValueError(
                 f"Resuspend volume {max_resuspend:.1f} µL exceeds {settings.resuspend_tip_ul} µL tips."
             )
-        log("Resuspending DNA to normalized concentration (slow dispense, gentle mix)...")
+        log(
+            "Resuspending DNA to normalized concentration "
+            f"(water cLLD, slow dispense, gentle mix)..."
+            if settings.water_lld
+            else "Resuspending DNA to normalized concentration (slow dispense, gentle mix)..."
+        )
         for group in group_by_source_column(plan.transfers):
             rows = [t.source_row for t in group]
             channels = _spaced_channels(rows)
@@ -1015,7 +1059,7 @@ async def run_protocol(lh, plan: RunPlan, log: LogFn = print) -> None:
                 vols=vols,
                 use_channels=channels,
                 flow_rates=[settings.water_flow_rate] * len(group),
-                spread="wide",
+                **_water_aspirate_kwargs(lh, water, len(channels), settings),
             )
             await lh.dispense(
                 wells,
