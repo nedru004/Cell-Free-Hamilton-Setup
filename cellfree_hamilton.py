@@ -61,6 +61,7 @@ class Settings:
     # 2 mL tubes sit higher in the 1.5 mL 32-position insert than the carrier model.
     mastermix_tube_z_offset_mm: float = 10.0
     mastermix_min_height_mm: float = 5.0
+    mastermix_aspirate_x_offset_mm: float = -2.0
     dna_flow_rate: float = 40.0
     dna_lld: bool = True
     dna_immersion_mm: float = 1.0
@@ -902,9 +903,12 @@ def _mastermix_aspirate_kwargs(lh, tube, settings: Settings) -> dict:
     """
     cavity_bottom = tube.get_location_wrt(lh.deck).z + tube.material_z_thickness
     min_z = cavity_bottom + settings.mastermix_min_height_mm
+    from pylabrobot.resources import Coordinate
+
     kwargs: dict = {
         "liquid_height": [settings.mastermix_min_height_mm],
         "minimum_height": [min_z],
+        "offsets": [Coordinate(settings.mastermix_aspirate_x_offset_mm, 0, 0)],
     }
     if not settings.mastermix_lld:
         return kwargs
